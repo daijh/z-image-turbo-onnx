@@ -1,0 +1,12 @@
+# onnxruntime-webgpu replaces onnxruntime (same import path) -- do not install both.
+onnxruntime-webgpu==1.27.0
+
+# CPU-only build: avoids pulling in nvidia-*-cu12 CUDA packages.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+
+onnx==1.22.0
+numpy==2.5.3
+psutil==7.2.2
+pillow==12.3.0
+transformers==5.16.1
