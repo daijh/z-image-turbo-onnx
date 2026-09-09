@@ -1,0 +1,14 @@
+# CPU-only build: avoids pulling in nvidia-*-cu12 CUDA packages.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+
+onnxruntime-genai==0.15.2
+onnxruntime==1.29.0
+transformers==5.16.1
+tqdm==4.70.0
+accelerate==1.14.0
+onnx==1.22.0
+onnx-ir==1.0.0
+diffusers==0.40.0
+numpy==2.5.3
+onnxconverter-common==1.16.0
