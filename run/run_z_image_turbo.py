@@ -17,6 +17,12 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+
+# Must run before any other onnxruntime call (e.g. get_available_providers/get_ep_devices further
+# below) creates the process-wide OrtEnv -- set_default_logger_severity is a no-op afterwards.
+if "--verbose" in sys.argv:
+    ort.set_default_logger_severity(0)  # verbose
+
 import psutil
 import torch
 from PIL import Image
@@ -93,6 +99,9 @@ class Scheduler:
     SHIFT = 3.0
 
     def timesteps(self, num_inference_steps: int) -> np.ndarray:
+        if num_inference_steps == 0:
+            return np.empty(0, dtype=np.float32)
+
         sigma = np.linspace(1.0, self.NUM_TRAIN_TIMESTEPS, self.NUM_TRAIN_TIMESTEPS, dtype=np.float32)[::-1] / self.NUM_TRAIN_TIMESTEPS
         sigma_max, sigma_min = sigma[0], sigma[-1]
 
@@ -107,32 +116,42 @@ class Scheduler:
 
 
 class ZImagePipeline:
-    def __init__(self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False, safety_checker: bool = False):
+    def __init__(
+        self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False, safety_checker: bool = False,
+        verbose: bool = False, profiling: str = None,
+    ):
         self.sync = sync
         self.use_safety_checker = safety_checker
+        self.sessions = []
         available = ort.get_available_providers()
         use_webgpu = ep == "WebGPU" or (not ep and "WebGpuExecutionProvider" in available)
         if ep == "WebGPU" and "WebGpuExecutionProvider" not in available:
             raise RuntimeError("WebGPU requested but not available in this onnxruntime build.")
 
+        sess_options = ort.SessionOptions()
+        if verbose:
+            sess_options.log_severity_level = 0  # verbose
+        self.profiling = use_webgpu and profiling is not None
+        self._profile_prefix = (profiling or "z_image_turbo") if self.profiling else None
+        if self.profiling:
+            sess_options.enable_profiling = True
         if use_webgpu:
             print("Execution provider: WebGpuExecutionProvider")
             webgpu_device = select_webgpu_device(gpu)
-            sess_options = ort.SessionOptions()
             sess_options.add_provider_for_devices([webgpu_device], {})
             session_kwargs = {"sess_options": sess_options}
             self.device_type, self.device_id = "webgpu", gpu
         else:
             print("Execution provider: CPUExecutionProvider")
-            session_kwargs = {"providers": ["CPUExecutionProvider"]}
+            session_kwargs = {"providers": ["CPUExecutionProvider"], "sess_options": sess_options}
             self.device_type, self.device_id = "cpu", 0
 
         onnx_dir = os.path.join(model_dir, "onnx")
-        self.text_encoder = ort.InferenceSession(os.path.join(onnx_dir, "text_encoder_model_q4f16.onnx"), **session_kwargs)
-        self.transformer = ort.InferenceSession(os.path.join(onnx_dir, "transformer_model_q4f16.onnx"), **session_kwargs)
-        self.scheduler_step = ort.InferenceSession(os.path.join(onnx_dir, "scheduler_step_model_f16.onnx"), **session_kwargs)
-        self.vae_pre_process = ort.InferenceSession(os.path.join(onnx_dir, "vae_pre_process_model_f16.onnx"), **session_kwargs)
-        self.vae_decoder = ort.InferenceSession(os.path.join(onnx_dir, "vae_decoder_model_f16.onnx"), **session_kwargs)
+        self.text_encoder = self._create_session(os.path.join(onnx_dir, "text_encoder_model_q4f16.onnx"), "text_encoder", session_kwargs)
+        self.transformer = self._create_session(os.path.join(onnx_dir, "transformer_model_q4f16.onnx"), "transformer", session_kwargs)
+        self.scheduler_step = self._create_session(os.path.join(onnx_dir, "scheduler_step_model_f16.onnx"), "scheduler_step", session_kwargs)
+        self.vae_pre_process = self._create_session(os.path.join(onnx_dir, "vae_pre_process_model_f16.onnx"), "vae_pre_process", session_kwargs)
+        self.vae_decoder = self._create_session(os.path.join(onnx_dir, "vae_decoder_model_f16.onnx"), "vae_decoder", session_kwargs)
 
         self.text_encoder_iob = self.text_encoder.io_binding()
         self.transformer_iob = self.transformer.io_binding()
@@ -168,8 +187,8 @@ class ZImagePipeline:
                         "build_safety_checker.py (see export_models.py's "
                         "--safety_checker_checkpoint)."
                     )
-            self.sc_prep = ort.InferenceSession(sc_prep_path, **session_kwargs)
-            self.safety_checker = ort.InferenceSession(safety_checker_path, **session_kwargs)
+            self.sc_prep = self._create_session(sc_prep_path, "sc_prep", session_kwargs)
+            self.safety_checker = self._create_session(safety_checker_path, "safety_checker", session_kwargs)
             self.sc_prep_iob = self.sc_prep.io_binding()
             self.safety_checker_iob = self.safety_checker.io_binding()
             log_session_io("sc_prep", self.sc_prep)
@@ -187,6 +206,13 @@ class ZImagePipeline:
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
         self.scheduler = Scheduler()
 
+    def _create_session(self, path: str, name: str, session_kwargs: dict) -> ort.InferenceSession:
+        if self.profiling:
+            session_kwargs["sess_options"].profile_file_prefix = f"{self._profile_prefix}_{name}"
+        session = ort.InferenceSession(path, **session_kwargs)
+        self.sessions.append(session)
+        return session
+
     def _build_embeds_uploader(self, session_kwargs: dict) -> None:
         from onnx import helper, TensorProto
 
@@ -199,13 +225,21 @@ class ZImagePipeline:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
         model.ir_version = 10
 
+        if self.profiling:
+            session_kwargs["sess_options"].profile_file_prefix = f"{self._profile_prefix}_embeds_uploader"
         self.embeds_uploader = ort.InferenceSession(model.SerializeToString(), **session_kwargs)
+        self.sessions.append(self.embeds_uploader)
         self.embeds_uploader_iob = self.embeds_uploader.io_binding()
         self.embeds_uploader_output = self.embeds_uploader.get_outputs()[0].name
 
     def to_ort_value(self, array: np.ndarray) -> ort.OrtValue:
         """Always backs a CPU OrtValue; GPU residency instead goes through bind_output."""
         return ort.OrtValue.ortvalue_from_numpy(array)
+
+    def end_profiling(self) -> list:
+        if not self.profiling:
+            return []
+        return [session.end_profiling() for session in self.sessions]
 
     def _run_bound(
         self, label: str, session: ort.InferenceSession, iob: "ort.IOBinding", output_names: list, inputs: dict
@@ -315,6 +349,9 @@ class ZImagePipeline:
         print(f"Prompt:\n{prompt}")
         prompt_embeds = timed("text_encoder", self.encode_prompt, prompt)
 
+        if num_inference_steps == 0:
+            print("steps=0: skipping transformer, decoding raw noise latents for debug purposes.")
+
         for step in range(num_inference_steps):
             timestep = timesteps[step]
             if not self.sync:
@@ -415,7 +452,7 @@ def parse_args():
         default="In a tranquil garden at dusk, a young Chinese woman stands gracefully in a red Hanfu with gold embroidery. Her flawless complexion features a red floral pattern on her forehead, enhancing her warm smile and expressive eyes. With her hair styled in a high bun adorned with a golden phoenix headdress, she holds a round folding fan decorated with nature scenes. Cherry blossom trees surround her, their petals drifting in the breeze, while a silhouetted pagoda (西安大雁塔) adds depth, blending tradition with modernity.",
         help="Text prompt to generate the image from.",
     )
-    parser.add_argument("-s", "--step", type=int, default=4, help="Number of denoising steps.")
+    parser.add_argument("-s", "--step", type=int, default=4, help="Number of denoising steps (0 skips the transformer entirely, for debugging).")
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("-o", "--output_name", default="z-image-turbo.png", help="Output image path.")
@@ -434,6 +471,14 @@ def parse_args():
         "~580 MB extra; build both with build_safety_checker.py first). Its runtime is printed "
         "separately and is NOT included in the pipeline's total-time metric.",
     )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable onnxruntime verbose logging (log severity 0).",
+    )
+    parser.add_argument(
+        "--profiling", type=str, nargs="?", const="", default=None,
+        help="Enable onnxruntime profiling for the WebGPU EP (optional: specify a file prefix); "
+        "writes one *.json Chrome trace per session in the current directory. Ignored with --ep CPU.",
+    )
     return parser.parse_args()
 
 
@@ -451,13 +496,16 @@ def main():
             "populate it."
         )
 
-    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync, args.safety_checker)
+    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync, args.safety_checker, args.verbose, args.profiling)
 
     output_name = Path(args.output_name)
     stem = f"{output_name.stem}_{args.width}x{args.height}_steps{args.step}"
     for i in range(args.loop):
         loop_name = output_name.with_name(f"{stem}_loop{i}{output_name.suffix}")
         pipeline.run(args.prompt, str(loop_name), args.step, args.height, args.width, args.all_images, args.seed)
+
+    for path in pipeline.end_profiling():
+        print(f"[Profiling] Profile saved: {path}")
 
     print(f"Peak Memory: {peak_memory_mb():.2f} MB")
 
