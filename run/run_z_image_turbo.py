@@ -118,61 +118,89 @@ class Scheduler:
 class ZImagePipeline:
     def __init__(
         self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False, safety_checker: bool = False,
-        verbose: bool = False, profiling: str = None,
+        verbose: bool = False, profiling: str = None, skip_transformer: bool = False,
+        height: int = 1024, width: int = 1024,
     ):
         self.sync = sync
         self.use_safety_checker = safety_checker
+        self.verbose = verbose
         self.sessions = []
         available = ort.get_available_providers()
         use_webgpu = ep == "WebGPU" or (not ep and "WebGpuExecutionProvider" in available)
         if ep == "WebGPU" and "WebGpuExecutionProvider" not in available:
             raise RuntimeError("WebGPU requested but not available in this onnxruntime build.")
 
-        sess_options = ort.SessionOptions()
-        if verbose:
-            sess_options.log_severity_level = 0  # verbose
+        self.use_webgpu = use_webgpu
+        self.webgpu_device = select_webgpu_device(gpu) if use_webgpu else None
         self.profiling = use_webgpu and profiling is not None
         self._profile_prefix = (profiling or "z_image_turbo") if self.profiling else None
-        if self.profiling:
-            sess_options.enable_profiling = True
         if use_webgpu:
             print("Execution provider: WebGpuExecutionProvider")
-            webgpu_device = select_webgpu_device(gpu)
-            sess_options.add_provider_for_devices([webgpu_device], {})
-            session_kwargs = {"sess_options": sess_options}
             self.device_type, self.device_id = "webgpu", gpu
         else:
             print("Execution provider: CPUExecutionProvider")
-            session_kwargs = {"providers": ["CPUExecutionProvider"], "sess_options": sess_options}
             self.device_type, self.device_id = "cpu", 0
 
-        onnx_dir = os.path.join(model_dir, "onnx")
-        self.text_encoder = self._create_session(os.path.join(onnx_dir, "text_encoder_model_q4f16.onnx"), "text_encoder", session_kwargs)
-        self.transformer = self._create_session(os.path.join(onnx_dir, "transformer_model_q4f16.onnx"), "transformer", session_kwargs)
-        self.scheduler_step = self._create_session(os.path.join(onnx_dir, "scheduler_step_model_f16.onnx"), "scheduler_step", session_kwargs)
-        self.vae_pre_process = self._create_session(os.path.join(onnx_dir, "vae_pre_process_model_f16.onnx"), "vae_pre_process", session_kwargs)
-        self.vae_decoder = self._create_session(os.path.join(onnx_dir, "vae_decoder_model_f16.onnx"), "vae_decoder", session_kwargs)
+        # Latent (height/width // 8) and full-resolution free dims are known up front from
+        # --height/--width, so they're overridden before session creation -- this lets the graph
+        # optimizer (e.g. NHWC layout transform, shape constant-folding) see static shapes instead
+        # of dynamic ones. "sequence_length"/"cap_seq_len" (text_encoder/transformer prompt-embed
+        # dims) stay dynamic: they depend on the tokenized prompt length, unknown until
+        # encode_prompt() runs after all sessions are already created.
+        latent_h, latent_w = height // 8, width // 8
 
-        self.text_encoder_iob = self.text_encoder.io_binding()
-        self.transformer_iob = self.transformer.io_binding()
-        self.scheduler_step_iob = self.scheduler_step.io_binding()
-        self.vae_pre_process_iob = self.vae_pre_process.io_binding()
+        onnx_dir = os.path.join(model_dir, "onnx")
+        self.text_encoder = self._create_session(os.path.join(onnx_dir, "text_encoder_model_q4f16.onnx"), "text_encoder")
+        if skip_transformer:
+            print("steps=0: skipping transformer model load.")
+            self.transformer = None
+        else:
+            self.transformer = self._create_session(
+                os.path.join(onnx_dir, "transformer_model_q4f16.onnx"), "transformer",
+                {"height": latent_h, "width": latent_w},
+            )
+        self.scheduler_step = self._create_session(
+            os.path.join(onnx_dir, "scheduler_step_model_f16.onnx"), "scheduler_step",
+            {"height": latent_h, "width": latent_w},
+        )
+        self.vae_pre_process = self._create_session(
+            os.path.join(onnx_dir, "vae_pre_process_model_f16.onnx"), "vae_pre_process",
+            {"height": latent_h, "width": latent_w},
+        )
+        self.vae_decoder = self._create_session(
+            os.path.join(onnx_dir, "vae_decoder_model_f16.onnx"), "vae_decoder",
+            {"latent_height": latent_h, "latent_width": latent_w, "height": height, "width": width},
+        )
+
+        self.text_encoder_iob = self.text_encoder.io_binding() if self.text_encoder is not None else None
+        self.transformer_iob = self.transformer.io_binding() if self.transformer is not None else None
+        self.scheduler_step_iob = self.scheduler_step.io_binding() if self.scheduler_step is not None else None
+        self.vae_pre_process_iob = self.vae_pre_process.io_binding() if self.vae_pre_process is not None else None
         self.vae_decoder_iob = self.vae_decoder.io_binding()
 
         print("Model shapes:")
-        log_session_io("text_encoder", self.text_encoder)
-        log_session_io("transformer", self.transformer)
-        log_session_io("scheduler_step", self.scheduler_step)
-        log_session_io("vae_pre_process", self.vae_pre_process)
+        if self.text_encoder is not None:
+            log_session_io("text_encoder", self.text_encoder)
+        if self.transformer is not None:
+            log_session_io("transformer", self.transformer)
+        if self.scheduler_step is not None:
+            log_session_io("scheduler_step", self.scheduler_step)
+        if self.vae_pre_process is not None:
+            log_session_io("vae_pre_process", self.vae_pre_process)
         log_session_io("vae_decoder", self.vae_decoder)
 
-        self.transformer_dtype = input_dtype(self.transformer, "hidden_states")
-        self.scheduler_step_dtype = input_dtype(self.scheduler_step, "latents")
-        self.vae_pre_process_dtype = input_dtype(self.vae_pre_process, "latents")
         self.vae_decoder_dtype = input_dtype(self.vae_decoder, "latent_sample")
+        self.vae_pre_process_dtype = input_dtype(self.vae_pre_process, "latents")
+        self.scheduler_step_dtype = input_dtype(self.scheduler_step, "latents")
+        # Falls back to scheduler_step's, then vae_pre_process's, then vae_decoder's dtype (matches
+        # latents dtype throughout the pipeline) when earlier stages aren't loaded.
+        self.transformer_dtype = (
+            input_dtype(self.transformer, "hidden_states") if self.transformer is not None
+            else self.scheduler_step_dtype
+        )
 
         self.text_encoder_output = self.text_encoder.get_outputs()[0].name
-        self.transformer_output = self.transformer.get_outputs()[0].name
+        self.transformer_output = self.transformer.get_outputs()[0].name if self.transformer is not None else None
         self.scheduler_step_output = self.scheduler_step.get_outputs()[0].name
         self.vae_pre_process_output = self.vae_pre_process.get_outputs()[0].name
         self.vae_decoder_output = self.vae_decoder.get_outputs()[0].name
@@ -187,8 +215,8 @@ class ZImagePipeline:
                         "build_safety_checker.py (see export_models.py's "
                         "--safety_checker_checkpoint)."
                     )
-            self.sc_prep = self._create_session(sc_prep_path, "sc_prep", session_kwargs)
-            self.safety_checker = self._create_session(safety_checker_path, "safety_checker", session_kwargs)
+            self.sc_prep = self._create_session(sc_prep_path, "sc_prep", {"height": height, "width": width})
+            self.safety_checker = self._create_session(safety_checker_path, "safety_checker")
             self.sc_prep_iob = self.sc_prep.io_binding()
             self.safety_checker_iob = self.safety_checker.io_binding()
             log_session_io("sc_prep", self.sc_prep)
@@ -201,19 +229,35 @@ class ZImagePipeline:
         # GPU EP only: uploads prompt embeds to the device once per prompt.
         self.embeds_uploader = None
         if self.device_type != "cpu":
-            self._build_embeds_uploader(session_kwargs)
+            self._build_embeds_uploader()
 
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
         self.scheduler = Scheduler()
 
-    def _create_session(self, path: str, name: str, session_kwargs: dict) -> ort.InferenceSession:
+    def _create_session(self, path_or_bytes, name: str, free_dims: dict = None) -> ort.InferenceSession:
+        # Fresh SessionOptions per session: free-dim names are only unique within a single graph
+        # (e.g. vae_decoder's output reuses "height"/"width" for the full-res image, while
+        # transformer/scheduler_step/vae_pre_process use the same names for the latent size), so
+        # overrides must not leak across sessions via a shared options object.
+        sess_options = ort.SessionOptions()
+        if self.verbose:
+            sess_options.log_severity_level = 0  # verbose
         if self.profiling:
-            session_kwargs["sess_options"].profile_file_prefix = f"{self._profile_prefix}_{name}"
-        session = ort.InferenceSession(path, **session_kwargs)
+            sess_options.enable_profiling = True
+            sess_options.profile_file_prefix = f"{self._profile_prefix}_{name}"
+        for dim_name, dim_value in (free_dims or {}).items():
+            sess_options.add_free_dimension_override_by_name(dim_name, dim_value)
+            print(f"  [{name}] free dimension override: '{dim_name}' = {dim_value}")
+        if self.use_webgpu:
+            sess_options.add_provider_for_devices([self.webgpu_device], {})
+            session_kwargs = {"sess_options": sess_options}
+        else:
+            session_kwargs = {"providers": ["CPUExecutionProvider"], "sess_options": sess_options}
+        session = ort.InferenceSession(path_or_bytes, **session_kwargs)
         self.sessions.append(session)
         return session
 
-    def _build_embeds_uploader(self, session_kwargs: dict) -> None:
+    def _build_embeds_uploader(self) -> None:
         from onnx import helper, TensorProto
 
         elem_type = TensorProto.FLOAT16 if self.transformer_dtype == np.float16 else TensorProto.FLOAT
@@ -225,10 +269,7 @@ class ZImagePipeline:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
         model.ir_version = 10
 
-        if self.profiling:
-            session_kwargs["sess_options"].profile_file_prefix = f"{self._profile_prefix}_embeds_uploader"
-        self.embeds_uploader = ort.InferenceSession(model.SerializeToString(), **session_kwargs)
-        self.sessions.append(self.embeds_uploader)
+        self.embeds_uploader = self._create_session(model.SerializeToString(), "embeds_uploader")
         self.embeds_uploader_iob = self.embeds_uploader.io_binding()
         self.embeds_uploader_output = self.embeds_uploader.get_outputs()[0].name
 
@@ -242,15 +283,18 @@ class ZImagePipeline:
         return [session.end_profiling() for session in self.sessions]
 
     def _run_bound(
-        self, label: str, session: ort.InferenceSession, iob: "ort.IOBinding", output_names: list, inputs: dict
+        self, label: str, session: ort.InferenceSession, iob: "ort.IOBinding", output_names: list, inputs: dict,
+        output_device_type: str = None, output_device_id: int = None,
     ) -> list:
+        device_type = self.device_type if output_device_type is None else output_device_type
+        device_id = self.device_id if output_device_id is None else output_device_id
         for name, value in inputs.items():
             if isinstance(value, np.ndarray):
                 iob.bind_cpu_input(name, value)
             else:
                 iob.bind_ortvalue_input(name, value)
         for name in output_names:
-            iob.bind_output(name, device_type=self.device_type, device_id=self.device_id)
+            iob.bind_output(name, device_type=device_type, device_id=device_id)
         if self.sync:
             iob.synchronize_inputs()
         session.run_with_iobinding(iob)
@@ -410,7 +454,7 @@ class ZImagePipeline:
         )[0]
 
     def _run_vae_decoder(self, scaled_latents_ov: ort.OrtValue) -> ort.OrtValue:
-        if self.vae_pre_process_dtype != self.vae_decoder_dtype:
+        if self.vae_pre_process_dtype is not None and self.vae_pre_process_dtype != self.vae_decoder_dtype:
             scaled_latents_ov = self.to_ort_value(scaled_latents_ov.numpy().astype(self.vae_decoder_dtype))
         return self._run_bound(
             "vae_decoder", self.vae_decoder, self.vae_decoder_iob, [self.vae_decoder_output],
@@ -496,13 +540,18 @@ def main():
             "populate it."
         )
 
-    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync, args.safety_checker, args.verbose, args.profiling)
+    pipeline = ZImagePipeline(
+        args.model, args.ep, args.gpu, args.sync, args.safety_checker, args.verbose, args.profiling,
+        skip_transformer=(args.step == 0),
+        height=args.height, width=args.width,
+    )
 
+    steps = args.step
     output_name = Path(args.output_name)
-    stem = f"{output_name.stem}_{args.width}x{args.height}_steps{args.step}"
+    stem = f"{output_name.stem}_{args.width}x{args.height}_steps{steps}"
     for i in range(args.loop):
         loop_name = output_name.with_name(f"{stem}_loop{i}{output_name.suffix}")
-        pipeline.run(args.prompt, str(loop_name), args.step, args.height, args.width, args.all_images, args.seed)
+        pipeline.run(args.prompt, str(loop_name), steps, args.height, args.width, args.all_images, args.seed)
 
     for path in pipeline.end_profiling():
         print(f"[Profiling] Profile saved: {path}")
