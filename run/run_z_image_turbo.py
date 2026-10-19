@@ -288,24 +288,30 @@ class ZImagePipeline:
     ) -> list:
         device_type = self.device_type if output_device_type is None else output_device_type
         device_id = self.device_id if output_device_id is None else output_device_id
-        for name, value in inputs.items():
-            if isinstance(value, np.ndarray):
-                iob.bind_cpu_input(name, value)
-            else:
-                iob.bind_ortvalue_input(name, value)
-        for name in output_names:
-            iob.bind_output(name, device_type=device_type, device_id=device_id)
-        if self.sync:
-            iob.synchronize_inputs()
-        session.run_with_iobinding(iob)
-        outputs = iob.get_outputs()
-        if self.sync:
-            # Reading each output back forces the real GPU wait (WebGPU dispatch is async).
-            iob.synchronize_outputs()
-            for value in outputs:
-                value.numpy()
-        self._log_io(label, inputs, output_names, outputs)
-        return outputs
+        try:
+            for name, value in inputs.items():
+                if isinstance(value, np.ndarray):
+                    iob.bind_cpu_input(name, value)
+                else:
+                    iob.bind_ortvalue_input(name, value)
+            for name in output_names:
+                iob.bind_output(name, device_type=device_type, device_id=device_id)
+            if self.sync:
+                iob.synchronize_inputs()
+            session.run_with_iobinding(iob)
+            outputs = iob.get_outputs()
+            if self.sync:
+                # Reading each output back forces the real GPU wait (WebGPU dispatch is async).
+                iob.synchronize_outputs()
+                for value in outputs:
+                    value.numpy()
+            self._log_io(label, inputs, output_names, outputs)
+            return outputs
+        finally:
+            # Returned OrtValues keep the output buffers alive for downstream stages.
+            # The reusable binding must not retain tensors from a completed call.
+            iob.clear_binding_inputs()
+            iob.clear_binding_outputs()
 
     def _device_label(self, value: ort.OrtValue) -> str:
         # device_name() reports "cuda" for any non-CPU device, not just actual CUDA.
@@ -552,6 +558,9 @@ def main():
     for i in range(args.loop):
         loop_name = output_name.with_name(f"{stem}_loop{i}{output_name.suffix}")
         pipeline.run(args.prompt, str(loop_name), steps, args.height, args.width, args.all_images, args.seed)
+        if i < args.loop - 1:
+            print("Waiting 3 seconds before the next loop...")
+            time.sleep(3)
 
     for path in pipeline.end_profiling():
         print(f"[Profiling] Profile saved: {path}")
