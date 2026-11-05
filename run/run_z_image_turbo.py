@@ -119,11 +119,12 @@ class ZImagePipeline:
     def __init__(
         self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False, safety_checker: bool = False,
         verbose: bool = False, profiling: str = None, skip_transformer: bool = False,
-        height: int = 1024, width: int = 1024,
+        height: int = 1024, width: int = 1024, disable_subgroup_matrix: bool = False,
     ):
         self.sync = sync
         self.use_safety_checker = safety_checker
         self.verbose = verbose
+        self.disable_subgroup_matrix = disable_subgroup_matrix
         self.sessions = []
         available = ort.get_available_providers()
         use_webgpu = ep == "WebGPU" or (not ep and "WebGpuExecutionProvider" in available)
@@ -136,6 +137,8 @@ class ZImagePipeline:
         self._profile_prefix = (profiling or "z_image_turbo") if self.profiling else None
         if use_webgpu:
             print("Execution provider: WebGpuExecutionProvider")
+            if disable_subgroup_matrix:
+                print("WebGPU disableFeatures: subgroupMatrix")
             self.device_type, self.device_id = "webgpu", gpu
         else:
             print("Execution provider: CPUExecutionProvider")
@@ -249,6 +252,10 @@ class ZImagePipeline:
             sess_options.add_free_dimension_override_by_name(dim_name, dim_value)
             print(f"  [{name}] free dimension override: '{dim_name}' = {dim_value}")
         if self.use_webgpu:
+            if self.disable_subgroup_matrix:
+                sess_options.add_session_config_entry(
+                    "ep.webgpuexecutionprovider.disableFeatures", "subgroupMatrix"
+                )
             sess_options.add_provider_for_devices([self.webgpu_device], {})
             session_kwargs = {"sess_options": sess_options}
         else:
@@ -498,6 +505,10 @@ def parse_args():
     parser.add_argument("--ep", default="", choices=["WebGPU", "CPU"], help="Execution provider.")
     parser.add_argument("--gpu", type=int, default=0, help="WebGPU device index, for machines with more than one GPU. Ignored with --ep CPU.")
     parser.add_argument(
+        "--disable_subgroup_matrix", action="store_true",
+        help="WebGPU: disable subgroup matrix kernels for every pipeline session and use fallbacks. Ignored with --ep CPU.",
+    )
+    parser.add_argument(
         "--prompt",
         default="In a tranquil garden at dusk, a young Chinese woman stands gracefully in a red Hanfu with gold embroidery. Her flawless complexion features a red floral pattern on her forehead, enhancing her warm smile and expressive eyes. With her hair styled in a high bun adorned with a golden phoenix headdress, she holds a round folding fan decorated with nature scenes. Cherry blossom trees surround her, their petals drifting in the breeze, while a silhouetted pagoda (西安大雁塔) adds depth, blending tradition with modernity.",
         help="Text prompt to generate the image from.",
@@ -550,6 +561,7 @@ def main():
         args.model, args.ep, args.gpu, args.sync, args.safety_checker, args.verbose, args.profiling,
         skip_transformer=(args.step == 0),
         height=args.height, width=args.width,
+        disable_subgroup_matrix=args.disable_subgroup_matrix,
     )
 
     steps = args.step
